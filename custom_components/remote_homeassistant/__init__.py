@@ -31,7 +31,7 @@ from homeassistant.const import (CONF_ABOVE, CONF_ACCESS_TOKEN, CONF_BELOW,
                                  CONF_PORT, CONF_UNIT_OF_MEASUREMENT,
                                  CONF_VERIFY_SSL, EVENT_CALL_SERVICE,
                                  EVENT_HOMEASSISTANT_STOP, EVENT_STATE_CHANGED,
-                                 SERVICE_RELOAD)
+                                 SERVICE_RELOAD, STATE_UNAVAILABLE)
 from homeassistant.core import (Context, EventOrigin, HomeAssistant, callback,
                                 split_entity_id)
 from homeassistant.helpers import device_registry as dr
@@ -139,6 +139,11 @@ CONFIG_SCHEMA = vol.Schema(
 
 HEARTBEAT_INTERVAL = 20
 HEARTBEAT_TIMEOUT = 5
+HEARTBEAT_MAX_RETRIES = 3
+
+RECONNECT_INITIAL_DELAY = 10
+RECONNECT_MAX_DELAY = 120
+RECONNECT_BACKOFF_FACTOR = 2
 
 INTERNALLY_USED_EVENTS = [EVENT_STATE_CHANGED]
 
@@ -344,6 +349,7 @@ class RemoteConnection:
         self._connection : Optional[ClientWebSocketResponse] = None
         self._heartbeat_task = None
         self._is_stopping = False
+        self._stop_listener_registered = False
         self._entities = set()
         self._all_entity_names = set()
         self._handlers = {}
@@ -445,27 +451,51 @@ class RemoteConnection:
         session = async_get_clientsession(self._hass, self._verify_ssl)
         self.set_connection_state(STATE_CONNECTING)
 
+        retry_delay = RECONNECT_INITIAL_DELAY
         while True:
             info = await _async_instance_get_info()
 
             # Verify we are talking to correct instance
             if not _async_instance_id_match(info):
                 self.set_connection_state(STATE_RECONNECTING)
-                await asyncio.sleep(10)
+                _LOGGER.debug(
+                    "Retrying in %d seconds...", retry_delay
+                )
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(
+                    retry_delay * RECONNECT_BACKOFF_FACTOR,
+                    RECONNECT_MAX_DELAY,
+                )
                 continue
 
             try:
                 _LOGGER.info("Connecting to %s", url)
-                self._connection = await session.ws_connect(url, max_msg_size = self._max_msg_size)
+                self._connection = await session.ws_connect(
+                    url, max_msg_size=self._max_msg_size
+                )
             except aiohttp.client_exceptions.ClientError:
-                _LOGGER.error("Could not connect to %s, retry in 10 seconds...", url)
+                _LOGGER.error(
+                    "Could not connect to %s, retry in %d seconds...",
+                    url,
+                    retry_delay,
+                )
                 self.set_connection_state(STATE_RECONNECTING)
-                await asyncio.sleep(10)
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(
+                    retry_delay * RECONNECT_BACKOFF_FACTOR,
+                    RECONNECT_MAX_DELAY,
+                )
             else:
-                _LOGGER.info("Connected to home-assistant websocket at %s", url)
+                _LOGGER.info(
+                    "Connected to home-assistant websocket at %s", url
+                )
                 break
 
-        self._hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_stop_handler)
+        if not self._stop_listener_registered:
+            self._hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STOP, _async_stop_handler
+            )
+            self._stop_listener_registered = True
 
         device_registry = dr.async_get(self._hass)
         device_registry.async_get_or_create(
@@ -482,6 +512,7 @@ class RemoteConnection:
 
     async def _heartbeat_loop(self):
         """Send periodic heartbeats to remote instance."""
+        consecutive_failures = 0
         while self._connection is not None and not self._connection.closed:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
 
@@ -496,12 +527,24 @@ class RemoteConnection:
 
             try:
                 await asyncio.wait_for(event.wait(), HEARTBEAT_TIMEOUT)
+                consecutive_failures = 0
             except asyncio.TimeoutError:
-                _LOGGER.warning("heartbeat failed")
+                consecutive_failures += 1
+                _LOGGER.warning(
+                    "Heartbeat failed (%d/%d)",
+                    consecutive_failures,
+                    HEARTBEAT_MAX_RETRIES,
+                )
 
-                # Schedule closing on event loop to avoid deadlock
-                asyncio.ensure_future(self._connection.close())
-                break
+                if consecutive_failures >= HEARTBEAT_MAX_RETRIES:
+                    _LOGGER.error(
+                        "Heartbeat failed %d consecutive times, "
+                        "closing connection",
+                        consecutive_failures,
+                    )
+                    # Schedule closing on event loop to avoid deadlock
+                    asyncio.ensure_future(self._connection.close())
+                    break
 
     async def async_stop(self):
         """Close connection."""
@@ -531,9 +574,22 @@ class RemoteConnection:
             await self._disconnected()
 
     async def _disconnected(self):
-        # Remove all published entries
-        for entity in self._entities:
-            self._hass.states.async_remove(entity)
+        if self._is_stopping:
+            # Intentional shutdown: remove entities cleanly
+            for entity in self._entities:
+                self._hass.states.async_remove(entity)
+            self._entities = set()
+        else:
+            # Connection lost: mark entities unavailable, keep tracking
+            for entity in self._entities:
+                current_state = self._hass.states.get(entity)
+                attrs = (
+                    dict(current_state.attributes) if current_state else {}
+                )
+                self._hass.states.async_set(
+                    entity, STATE_UNAVAILABLE, attrs
+                )
+
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             try:
@@ -546,7 +602,8 @@ class RemoteConnection:
         self.set_connection_state(STATE_DISCONNECTED)
         self._heartbeat_task = None
         self._remove_listener = None
-        self._entities = set()
+        self._handlers = {}
+        self.__id = 1
         self._all_entity_names = set()
         if not self._is_stopping:
             asyncio.ensure_future(self.async_connect())
@@ -589,7 +646,14 @@ class RemoteConnection:
 
             if message["type"] == api.TYPE_AUTH_OK:
                 self.set_connection_state(STATE_CONNECTED)
-                await self._init()
+                try:
+                    await self._init()
+                except Exception:
+                    _LOGGER.exception(
+                        "Failed to initialize connection to %s",
+                        self._entry.data.get(CONF_HOST, "unknown"),
+                    )
+                    break
 
             elif message["type"] == api.TYPE_AUTH_REQUIRED:
                 if self._access_token:

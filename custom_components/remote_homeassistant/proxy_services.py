@@ -50,6 +50,10 @@ class ProxyServices:
         """Called when list of remote services is available."""
         self.remote_services = message["result"]
 
+        # Clean up previously registered services before re-registering
+        await self.unload()
+        self.registered_services = []
+
         # A service prefix is needed to not clash with original service names
         service_prefix = self.entry.options.get(CONF_SERVICE_PREFIX)
         if not service_prefix:
